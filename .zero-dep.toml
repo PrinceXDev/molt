@@ -1,0 +1,15 @@
+# Zero Dependency Hackathon submission metadata.
+
+track = "A"
+name = "molt"
+language = "go"
+pitch = "Finds the dependencies the Go standard library has already replaced, and rewrites the ones it can do safely."
+
+# Bonus challenge. One, nailed: molt builds byte-identically on windows, linux
+# and darwin. Run `make repro` to verify, or see README for the published hashes.
+bonus = "reproducible-build"
+
+[build]
+command = "go build -o molt ./cmd/molt"
+test = "go test ./..."
+proof = "make deps-proof"

@@ -1,0 +1,49 @@
+molt dependency proof
+=====================
+
+Reproduce this file with: make deps-proof
+
+1. go.mod in full
+-----------------
+module molt
+
+go 1.25
+
+There is no require block. Nothing to audit.
+
+2. Modules in the build graph
+-----------------------------
+$ go list -m all
+molt
+
+molt itself, and nothing else.
+
+3. Every package in the build, filtered for non-stdlib
+------------------------------------------------------
+$ go list -deps ./... | grep -v '^molt' | awk -F/ '$1 ~ /\./'
+(no output)
+
+Every path in the build graph is either molt's own or a standard-library
+package. A third-party path would begin with a domain name and appear here.
+
+4. Standard-library packages molt imports
+-----------------------------------------
+bufio bytes cmp encoding encoding/base64 encoding/json errors flag fmt 
+go/ast go/build/constraint go/doc/comment go/format 
+go/internal/scannerhooks go/parser go/printer go/scanner go/token io io/fs 
+iter math math/bits os path path/filepath reflect runtime slices sort 
+strconv strings structs sync sync/atomic syscall text/tabwriter time 
+unicode unicode/utf16 unicode/utf8 unsafe 
+
+5. No vendored source
+---------------------
+No vendor/ directory.
+
+The only third-party code in this repository is under testdata/, which
+holds fixture modules that are never built. Their go.mod files declare
+requires on purpose, so molt has something to find. The go command and
+molt's own scanner both skip directories named testdata.
+
+6. go.sum
+---------
+No go.sum. With no requires there are no module hashes to record.
