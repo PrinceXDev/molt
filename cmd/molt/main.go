@@ -152,7 +152,7 @@ func scanRoot(root string, opt options, stdout, stderr io.Writer) int {
 	}
 
 	if opt.showDiff || opt.apply {
-		changed, err := rewriteAll(root, src, opt.apply, stdout, stderr)
+		changed, err := rewriteAll(root, mod, src, opt.apply, stdout, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "molt: %v\n", err)
 			return exitInternal
@@ -174,15 +174,27 @@ func scanRoot(root string, opt options, stdout, stderr io.Writer) int {
 
 // rewriteAll walks the scanned files and applies every mechanical migration each
 // one is eligible for. With apply false it prints diffs and writes nothing.
-func rewriteAll(root string, src *scan.Result, apply bool, stdout, stderr io.Writer) (int, error) {
+//
+// Eligibility is filtered by analyze.Ineligible before a single file is ever
+// touched, using the same module-level checks (Go version, replace
+// directives) the report itself shows. Without that filter this function
+// could rewrite a file to use a standard-library API the module's declared Go
+// version does not yet provide, or rewrite an import that go.mod has
+// redirected to code the corpus never verified.
+func rewriteAll(root string, mod *gomod.File, src *scan.Result, apply bool, stdout, stderr io.Writer) (int, error) {
 	mechanical := make([]corpus.Migration, 0, 8)
 	for _, m := range corpus.All() {
-		if m.Mechanical() {
-			mechanical = append(mechanical, m)
+		if !m.Mechanical() {
+			continue
 		}
+		if analyze.Ineligible(mod, m) != "" {
+			continue
+		}
+		mechanical = append(mechanical, m)
 	}
 
 	changed := 0
+	var failed []string
 	for _, f := range src.Files {
 		// Only bother with files importing something molt can act on.
 		applicable := mechanical[:0:0]
@@ -202,11 +214,13 @@ func rewriteAll(root string, src *scan.Result, apply bool, stdout, stderr io.Wri
 		before, err := os.ReadFile(abs)
 		if err != nil {
 			fmt.Fprintf(stderr, "molt: %s: %v\n", f.Path, err)
+			failed = append(failed, f.Path)
 			continue
 		}
 		res, err := rewrite.File(f.Path, before, applicable)
 		if err != nil {
 			// A file molt cannot rewrite cleanly is left exactly as it was.
+			// This is not a failure of the run: refusing is the safe outcome.
 			fmt.Fprintf(stderr, "molt: %s: %v\n", f.Path, err)
 			continue
 		}
@@ -220,7 +234,7 @@ func rewriteAll(root string, src *scan.Result, apply bool, stdout, stderr io.Wri
 			if info, err := os.Stat(abs); err == nil {
 				mode = info.Mode().Perm()
 			}
-			if err := os.WriteFile(abs, res.Source, mode); err != nil {
+			if err := writeFileAtomic(abs, res.Source, mode); err != nil {
 				return changed, fmt.Errorf("%s: %w", f.Path, err)
 			}
 			fmt.Fprintf(stdout, "  rewrote %s\n", f.Path)
@@ -232,7 +246,47 @@ func rewriteAll(root string, src *scan.Result, apply bool, stdout, stderr io.Wri
 		}
 		changed++
 	}
+	if len(failed) > 0 {
+		return changed, fmt.Errorf("%s could not be read: %s",
+			plural(len(failed), "file", "files"), strings.Join(failed, ", "))
+	}
 	return changed, nil
+}
+
+// writeFileAtomic writes data to path without ever leaving it half-written.
+// It writes to a temporary file in the same directory, syncs it, then renames
+// it over path — rename is atomic on both POSIX and Windows, so a crash or a
+// full disk mid-write leaves the original file intact rather than truncated.
+// The temp file lives in the same directory as path so the rename cannot
+// cross a filesystem boundary.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".molt-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if err != nil {
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err = tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Chmod(tmpPath, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func readGoMod(root string) (*gomod.File, error) {

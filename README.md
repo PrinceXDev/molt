@@ -149,6 +149,14 @@ On top of that, molt declines to touch a file when:
 - the package's name is shadowed anywhere in the file by a variable, parameter,
   type or field;
 - the file uses any symbol not in the verified replacement table;
+- an unaliased rewrite would introduce a qualifier (the target package's own
+  name) that collides with a local binding, or with an existing import of that
+  same path under an incompatible alias;
+- the module's `go.mod` declares a Go version below what the migration's
+  standard-library target needs — or declares no version at all, which is
+  treated the same as too low;
+- the module's `go.mod` redirects the dependency with a `replace` directive,
+  since the code behind the import path might not be what the corpus verified;
 - the rewritten file does not re-parse — molt parses its own output and refuses
   to write anything the parser rejects.
 
@@ -167,13 +175,23 @@ reason a careful tool beats a find-and-replace, and each one is pinned by a test
 | Looks like | Actually |
 |---|---|
 | `x/exp/slices.SortFunc` → `slices.SortFunc` | The comparison changed from `less(a, b) bool` to `cmp(a, b) int`. An import swap **compiles and then sorts wrongly.** |
+| `x/exp/slices.SortStable` → `slices.SortStable` | Does not exist. The standard library only has `SortStableFunc`. An import swap **fails to compile.** |
 | `x/exp/maps.Keys` → `maps.Keys` | Return type changed from a slice to an `iter.Seq`. Needs `slices.Collect`. |
 | `google/uuid.Nil` → `uuid.Nil` | A package **variable** in google/uuid, a **function** in the standard library. `uuid.Nil` must become `uuid.Nil()`. |
 | `google/uuid.NewRandom` → `uuid.NewV4` | google returns `(UUID, error)`; the stdlib returns `UUID` alone. The arity of the call site changes. |
+| `pkg/errors.New` / `.Errorf` | Both capture a retrievable stack trace. The stdlib `errors.New` / `fmt.Errorf` do not. **Not a rename — a feature removal.** |
 | `pkg/errors.Wrap(err, msg)` | Becomes `fmt.Errorf("%s: %w", msg, err)` — the arguments swap places. Not a rename. |
+| `go-homedir.Dir` → `os.UserHomeDir` | Identical `(string, error)` signature, but go-homedir caches its first result and `os.UserHomeDir` reads the environment every call. Safe in isolation, unsafe if another file in the package calls `Reset` or `DisableCache`. |
 
 `slices.SortFunc` is the one worth staring at. Both versions compile. Both run.
 One of them sorts your data incorrectly. molt refuses the file.
+
+`pkg/errors.New` and `go-homedir.Dir` are the two that a code review caught
+after this table first shipped: both looked like clean renames because their
+signatures matched exactly, and neither is one. Signature equality is
+necessary for a mechanical rewrite; it was never sufficient, and these two
+rows are why `Verified` and `Mechanical` are now separate flags molt actually
+checks, not just documentation.
 
 ## Validated against real repositories
 
@@ -182,11 +200,11 @@ this table is a fixture.
 
 | Repository | Go files | Result |
 |---|---|---|
-| ory/kratos | 1,376 | `pkg/errors`: 1,785 uses in 286 files — **40 migratable now** |
+| ory/kratos | 1,376 | `pkg/errors`: 1,785 uses in 286 files — **11 migratable now** |
 | jaegertracing/jaeger | 1,166 | 6 advisory |
-| minio/minio | 902 | 1 removable, 2 partly (**21 of 29** uuid files), 4 advisory |
+| minio/minio | 902 | 7 advisory |
 | docker/cli | 724 | 4 advisory (`logrus` 82 uses, `cobra` 1,120 uses) |
-| gofiber/fiber | 308 | **`google/uuid` fully removable** |
+| gofiber/fiber | 308 | 3 advisory |
 | go-kit/kit | 248 | 3 advisory |
 | prometheus/client_golang | 162 | `json-iterator`: 83 uses in 3 files |
 | sirupsen/logrus | 53 | dot-import and shadowing both detected |
@@ -205,7 +223,17 @@ calling out:
 - The shadowing and dot-import defences **fired on real code**, in logrus and
   viper, not just in tests. The conservative design is not theoretical.
 
-The 23 files molt rewrote in minio were all `gofmt`-clean afterwards.
+**These numbers are smaller than an earlier pass reported, on purpose.** A code
+review caught two rows that had been marked mechanical on signature match alone
+(`pkg/errors.New`/`Errorf`, `go-homedir.Dir` — see "The traps molt knows about")
+and a missing check that let a migration apply regardless of the target
+module's declared Go version. Both are fixed. gofiber/fiber and minio/minio
+each lost a `google/uuid` migration this pass: both declare `go 1.24` or
+`go 1.25` in their `go.mod`, below the `go1.27` the stdlib `uuid` package
+needs, and molt now correctly declines to touch it. ory/kratos's `pkg/errors`
+count dropped from 40 files to 11, because `New` and `Errorf` — the two
+symbols responsible for most of that count — no longer qualify. A smaller,
+correct number here is the point of the exercise.
 
 Performance: 1,376 files scanned in **0.51s**. No network, no module cache read,
 no clock.
@@ -234,11 +262,14 @@ Stated plainly, because they matter more than the feature list.
    organisers' published Go table plus the ones I found useful, and it will miss
    dependencies it has never heard of. `molt -corpus` prints exactly what it
    knows; the report's KEEP section names what it does not.
-7. **Mechanical wins are rarer on well-maintained code.** The honest finding from
-   the validation run: modern, actively-maintained repos have mostly already
-   migrated off `x/exp/slices` and `x/net/context`. The value is concentrated in
-   `google/uuid` (nine days old at time of writing) and in the long tail of older
-   codebases.
+7. **Mechanical wins are rarer than the corpus size suggests, and rarer still
+   after the Go-version gate.** Modern, actively-maintained repos have mostly
+   already migrated off `x/exp/slices` and `x/net/context`. `google/uuid` is
+   the newest and most promising row — but it needs Go 1.27, released nine
+   days before this event began, so most real modules do not qualify for it
+   yet even when they use the package. That gate is doing its job: a module
+   declaring `go 1.24` should not have its imports rewritten to a standard
+   library it has not adopted.
 
 molt does not claim your tests will pass after `-apply`. It claims the edit is
 behaviour-preserving for the symbols it permits, and that you should run your
@@ -290,9 +321,9 @@ Verified byte-identical on three platforms with Go 1.27.0:
 
 | Target | SHA-256 |
 |---|---|
-| windows/amd64 | `7e63dbec4905cb49bace779061866a2cc2df14b3bb611ff25954938bb809519f` |
-| linux/amd64 | `a2404cdbeff1972aba206b425eb6d89160b0a98fb476f7c9efed93f5835a457e` |
-| darwin/arm64 | `ada1bb2e7437628e2d36b83946a50cbc4b4680fd6ebf8555d8918ae0de7eeb90` |
+| windows/amd64 | `89f9e03a4b0239a010ceece14535ec13a6a0fcb0bb4569da5828b3292fcddba4` |
+| linux/amd64 | `c59a5c5edb7003e7bef837fae717504789740b83bd87e2a21a324635c5e69852` |
+| darwin/arm64 | `2c08a9a71dabe63435be289281f81dfffe2da82ac7e45e06bc607435bacb81a5` |
 
 Determinism in Go is not free. Three things break it by default:
 
@@ -323,15 +354,34 @@ The suite is behavioural. The ones worth reading:
   check.
 - **`TestCheatSheetTableIsCovered`** — pins the corpus to every row of the
   organisers' published Go table, with the release version each landed in.
-- **`TestTrapsArePinned`** — asserts that `slices.SortFunc`, `maps.Keys`,
-  `uuid.Nil` and friends stay blocked. If someone "helpfully" unblocks one, the
-  suite fails.
+- **`TestTrapsArePinned`** — asserts that `slices.SortFunc`, `slices.SortStable`,
+  `maps.Keys`, `uuid.Nil`, and `pkg/errors.New`/`Errorf` stay blocked. If
+  someone "helpfully" unblocks one, the suite fails.
+- **`TestVersionGateBlocksNewerMigration`**, **`TestReplaceDirectiveVetoesMigration`**
+  — a migration is not offered when the module's declared Go version is too
+  low, or when `go.mod` redirects the dependency with a `replace` directive.
+- **`TestRefusesReuseOfIncompatibleQualifier`**, **`TestRefusesTargetQualifierCollision`**
+  — an unaliased rewrite is refused rather than corrupted when the qualifier it
+  would introduce is already bound to something else in the file.
+- **`TestRewriteReportsReadFailures`** — a file that vanishes between scanning
+  and rewriting fails the run with a non-zero exit, rather than being logged
+  and silently skipped.
+- **`TestApplyWritesAtomicallyAndCleansUp`** — `-apply` writes through a
+  temporary file and renames it into place, so a crash or a full disk mid-write
+  cannot leave a source file truncated.
 - **`TestOutputIsDeterministic`** — runs the whole pipeline twice and compares
   bytes, for text, verbose and JSON.
 - **`TestRefusesShadowedName`**, **`TestRefusesBlockedSymbol`**,
   **`TestRefusesAliasedSplit`** — the refusals, asserted as features.
 
-Coverage runs 78–95% per package.
+Nine of the tests above pin fixes made after an automated code review: a
+missing Go-version check, an unmodelled `replace` directive, an import-alias
+collision, a target-qualifier collision, two corpus rows marked mechanical on
+signature match alone, a nonexistent stdlib symbol in the corpus, a non-atomic
+write, and a swallowed read error. Each fix has a test that fails if it
+regresses.
+
+Coverage runs 80–95% per package.
 
 ## JSON output
 
@@ -369,7 +419,7 @@ Coverage runs 78–95% per package.
   ],
   "kept": [ { "module": "github.com/aws/aws-sdk-go-v2", "symbols": 18, "refs": 94 } ],
   "corpus_rows": 24,
-  "corpus_mechanical": 6
+  "corpus_mechanical": 5
 }
 ```
 

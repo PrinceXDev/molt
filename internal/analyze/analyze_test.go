@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"molt/internal/corpus"
 	"molt/internal/gomod"
 	"molt/internal/scan"
 )
@@ -48,7 +49,7 @@ func find(r *Report, module string) *Finding {
 }
 
 func TestMechanicalMigrationIsAuto(t *testing.T) {
-	mod, src := fixture(t, "module m\n\nrequire golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842\n", map[string]string{
+	mod, src := fixture(t, "module m\n\ngo 1.25\n\nrequire golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842\n", map[string]string{
 		"a.go": `package a
 
 import "golang.org/x/exp/slices"
@@ -116,7 +117,7 @@ func f(s []int) {
 }
 
 func TestShadowingDowngradesToAdvisory(t *testing.T) {
-	mod, src := fixture(t, "module m\n", map[string]string{
+	mod, src := fixture(t, "module m\n\ngo 1.25\n", map[string]string{
 		"a.go": `package a
 
 import "golang.org/x/exp/slices"
@@ -274,6 +275,8 @@ func TestCleanModule(t *testing.T) {
 func TestFindingOrderIsDeterministic(t *testing.T) {
 	goMod := `module m
 
+go 1.24
+
 require (
 	github.com/gorilla/mux v1.8.1
 	github.com/sirupsen/logrus v1.9.3
@@ -336,5 +339,159 @@ func TestSkippedFilesAreReported(t *testing.T) {
 	}
 	if r.Skipped[0].Reason == "" {
 		t.Error("skipped file has no reason")
+	}
+}
+
+// A migration is not offered automatically when the module's declared Go
+// version is below the migration's Since. Rewriting uuid.New into the
+// stdlib's uuid package on a module that only promises Go 1.24 would produce
+// code that cannot build with the toolchain the module claims to support.
+func TestVersionGateBlocksNewerMigration(t *testing.T) {
+	mod, src := fixture(t, "module m\n\ngo 1.24\n\nrequire github.com/google/uuid v1.6.0\n", map[string]string{
+		"a.go": `package a
+
+import "github.com/google/uuid"
+
+func f() string { return uuid.New().String() }
+`,
+	})
+	r := Run(mod, src)
+	f := find(r, "github.com/google/uuid")
+	if f == nil {
+		t.Fatal("no finding for google/uuid")
+	}
+	if f.Auto {
+		t.Error("Auto = true for a module below the migration's Since version")
+	}
+	joined := strings.Join(f.Blockers, " ")
+	if !strings.Contains(joined, "go1.27") || !strings.Contains(joined, "1.24") {
+		t.Errorf("blockers = %v, want one naming both go1.27 and 1.24", f.Blockers)
+	}
+}
+
+func TestVersionGateAllowsWhenSatisfied(t *testing.T) {
+	mod, src := fixture(t, "module m\n\ngo 1.27\n\nrequire github.com/google/uuid v1.6.0\n", map[string]string{
+		"a.go": `package a
+
+import "github.com/google/uuid"
+
+func f() string { return uuid.New().String() }
+`,
+	})
+	r := Run(mod, src)
+	f := find(r, "github.com/google/uuid")
+	if f == nil {
+		t.Fatal("no finding for google/uuid")
+	}
+	if !f.Auto {
+		t.Errorf("Auto = false for a module satisfying go1.27, blockers %v", f.Blockers)
+	}
+}
+
+// A missing go directive is treated conservatively: unknown does not satisfy
+// a requirement above go1.0, since the module's real floor cannot be
+// confirmed high enough.
+func TestMissingGoDirectiveIsConservative(t *testing.T) {
+	mod, src := fixture(t, "module m\n\nrequire golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842\n", map[string]string{
+		"a.go": `package a
+
+import "golang.org/x/exp/slices"
+
+func f(s []int) { slices.Sort(s) }
+`,
+	})
+	r := Run(mod, src)
+	f := find(r, "golang.org/x/exp/slices")
+	if f == nil {
+		t.Fatal("no finding")
+	}
+	if f.Auto {
+		t.Error("Auto = true with no go directive; the module's minimum Go version is unknown")
+	}
+	joined := strings.Join(f.Blockers, " ")
+	if !strings.Contains(joined, "not declared") {
+		t.Errorf("blockers = %v, want one noting the version is undeclared", f.Blockers)
+	}
+}
+
+// A replace directive means the code behind the import path might not be the
+// code the corpus verified — a local fork, a patch, an unrelated module. The
+// migration must not be offered automatically regardless of Go version or
+// which symbols are used.
+func TestReplaceDirectiveVetoesMigration(t *testing.T) {
+	goMod := `module m
+
+go 1.25
+
+require golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842
+
+replace golang.org/x/exp => ../local-fork-of-exp
+`
+	mod, src := fixture(t, goMod, map[string]string{
+		"a.go": `package a
+
+import "golang.org/x/exp/slices"
+
+func f(s []int) { slices.Sort(s) }
+`,
+	})
+	r := Run(mod, src)
+	f := find(r, "golang.org/x/exp/slices")
+	if f == nil {
+		t.Fatal("no finding")
+	}
+	if f.Auto {
+		t.Error("Auto = true for a module replaced by a local fork")
+	}
+	joined := strings.Join(f.Blockers, " ")
+	if !strings.Contains(joined, "replaces") || !strings.Contains(joined, "local-fork-of-exp") {
+		t.Errorf("blockers = %v, want one naming the replace target", f.Blockers)
+	}
+}
+
+// A replace veto takes priority even when every used symbol would otherwise
+// be safe — the fork could have a different implementation behind the same
+// name, which per-symbol safety cannot see.
+func TestReplaceVetoOverridesSafeSymbols(t *testing.T) {
+	goMod := `module m
+
+go 1.27
+
+require github.com/google/uuid v1.6.0
+
+replace github.com/google/uuid => github.com/example/uuid-fork v0.0.0
+`
+	mod, src := fixture(t, goMod, map[string]string{
+		"a.go": `package a
+
+import "github.com/google/uuid"
+
+func f() string { return uuid.New().String() }
+`,
+	})
+	r := Run(mod, src)
+	f := find(r, "github.com/google/uuid")
+	if f == nil {
+		t.Fatal("no finding")
+	}
+	if f.Auto {
+		t.Error("Auto = true despite the module being replaced")
+	}
+}
+
+func TestIneligibleFunction(t *testing.T) {
+	m, ok := corpus.Lookup("github.com/google/uuid")
+	if !ok {
+		t.Fatal("google/uuid missing from corpus")
+	}
+
+	if reason := Ineligible(nil, m); reason == "" {
+		t.Error("Ineligible(nil, uuid) = \"\", want a version reason")
+	}
+	if reason := Ineligible(&gomod.File{GoVersion: "1.27"}, m); reason != "" {
+		t.Errorf("Ineligible with go1.27 = %q, want empty", reason)
+	}
+	if reason := Ineligible(&gomod.File{GoVersion: "1.24"}, m); reason == "" {
+		t.Error("Ineligible with go1.24 = \"\", want a version reason")
 	}
 }

@@ -62,7 +62,6 @@ func File(filename string, src []byte, migs []corpus.Migration) (*Result, error)
 
 	res := &Result{Source: src}
 	declared := scan.DeclaredNames(af)
-	existing := importedPaths(af)
 
 	var applied []Edit
 	for _, m := range migs {
@@ -85,15 +84,15 @@ func File(filename string, src []byte, migs []corpus.Migration) (*Result, error)
 			continue
 		}
 
-		edit, err := applyOne(af, spec, m, local, alias, existing)
+		// Queried live rather than precomputed once: an earlier migration in
+		// this same loop may already have added or removed an import, and the
+		// next migration needs to see that, not a stale snapshot.
+		edit, err := applyOne(af, spec, m, local, alias, declared)
 		if err != nil {
 			res.Refusals = append(res.Refusals, Refusal{m.Module, err.Error()})
 			continue
 		}
 		applied = append(applied, *edit)
-		for _, path := range edit.To {
-			existing[path] = true
-		}
 	}
 
 	if len(applied) == 0 {
@@ -214,9 +213,10 @@ func isStdlibPath(path string) bool {
 	return !strings.Contains(first, ".")
 }
 
-// applyOne rewrites one migration's selectors and repoints its import. Targets
-// already present in existing are reused rather than duplicated.
-func applyOne(af *ast.File, spec *ast.ImportSpec, m corpus.Migration, local string, alias bool, existing map[string]bool) (*Edit, error) {
+// applyOne rewrites one migration's selectors and repoints its import. A
+// target already imported under its canonical, unaliased name is reused
+// rather than duplicated.
+func applyOne(af *ast.File, spec *ast.ImportSpec, m corpus.Migration, local string, alias bool, declared map[string]bool) (*Edit, error) {
 	// Resolve everything before mutating anything, so an unreplaceable symbol
 	// cannot leave the file half-edited.
 	type change struct {
@@ -258,6 +258,28 @@ func applyOne(af *ast.File, spec *ast.ImportSpec, m corpus.Migration, local stri
 		return nil, fmt.Errorf("aliased import cannot be split across %d stdlib packages", len(targets))
 	}
 
+	// An unaliased rewrite introduces a new qualifier at every call site: the
+	// target's own package name. That name must not collide with anything
+	// else in the file, whether a local binding (a var, func, or type named
+	// "fmt") or a conflicting import of the same target path under a
+	// different name (an alias, a dot import, or a blank import). Checking
+	// this before any node is mutated keeps a rejected migration from leaving
+	// half its selectors renamed.
+	if !alias {
+		for t := range targets {
+			want, err := pkgIdent(t)
+			if err != nil {
+				return nil, err
+			}
+			if declared[want] {
+				return nil, fmt.Errorf("package name %s is shadowed in this file, which this migration would introduce as the qualifier for %s", want, t)
+			}
+			if q, imported := qualifierFor(af, t); imported && q != want {
+				return nil, fmt.Errorf("%s is already imported as %q in this file, which conflicts with the unaliased %q this migration needs", t, q, want)
+			}
+		}
+	}
+
 	edit := &Edit{From: m.Module, Symbols: len(changes)}
 	renames := map[string]bool{}
 	// Mutate names in place. ast.NewIdent carries token.NoPos, and go/printer
@@ -289,10 +311,13 @@ func applyOne(af *ast.File, spec *ast.ImportSpec, m corpus.Migration, local stri
 	edit.To = sorted
 
 	// Repoint the old spec at the first missing target and add the rest; if
-	// every target is already imported, drop the spec.
+	// every target is already imported, drop the spec. A target counts as
+	// already present only if the earlier collision check passed for it,
+	// which guarantees any existing import of that path already uses the
+	// canonical unaliased qualifier this rewrite is about to rely on.
 	var needed []string
 	for _, t := range sorted {
-		if !existing[t] {
+		if _, imported := qualifierFor(af, t); !imported {
 			needed = append(needed, t)
 		}
 	}
@@ -319,14 +344,29 @@ func findImport(af *ast.File, path string) *ast.ImportSpec {
 	return nil
 }
 
-func importedPaths(af *ast.File) map[string]bool {
-	out := map[string]bool{}
+// qualifierFor reports the identifier the file already uses to refer to path,
+// and whether path is imported at all. "." and "_" are reported as
+// themselves, distinct from any real package name, so a caller comparing
+// against a canonical name like "fmt" correctly treats them as incompatible.
+func qualifierFor(af *ast.File, path string) (qualifier string, imported bool) {
 	for _, spec := range af.Imports {
-		if p, err := strconv.Unquote(spec.Path.Value); err == nil {
-			out[p] = true
+		p, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || p != path {
+			continue
 		}
+		if spec.Name != nil {
+			return spec.Name.Name, true
+		}
+		// Unaliased: the qualifier is the package's own declared name. Every
+		// path this function is ever asked about is one of rewrite's own
+		// known targets, so pkgIdent always resolves it.
+		name, err := pkgIdent(path)
+		if err != nil {
+			return "", true
+		}
+		return name, true
 	}
-	return out
+	return "", false
 }
 
 // localName returns the identifier the file uses to qualify the package, and

@@ -27,14 +27,95 @@ type Require struct {
 }
 
 // File is the parsed subset of a go.mod.
+// Replace is one replace directive: Old is redirected to New, optionally at
+// NewVersion. NewVersion is empty for a local filesystem replacement.
+type Replace struct {
+	Old        string
+	OldVersion string
+	New        string
+	NewVersion string
+	Line       int
+}
+
 type File struct {
 	Module    string
 	GoVersion string
 	Toolchain string
 	Requires  []Require
+	Replaces  []Replace
 
 	// Unknown counts directives this package does not model, by name.
 	Unknown map[string]int
+}
+
+// Replaced reports whether importPath is redirected by a replace directive,
+// either directly or because it names a package inside a replaced module. A
+// replace directive operates on a module path, and a module can contain many
+// packages: "replace golang.org/x/exp => ../fork" redirects
+// golang.org/x/exp/slices too, even though the directive never names it.
+//
+// A replace means the code behind this import path is not necessarily the
+// code the corpus verified: it could be a local fork, a patched version, or
+// an unrelated module entirely. Callers must treat a replaced import as
+// unverified regardless of what the corpus says about the original path.
+func (f *File) Replaced(importPath string) (Replace, bool) {
+	for _, r := range f.Replaces {
+		if r.Old == importPath || strings.HasPrefix(importPath, r.Old+"/") {
+			return r, true
+		}
+	}
+	return Replace{}, false
+}
+
+// SatisfiesGo reports whether this module's declared go directive is at
+// least since (for example "go1.21"). A missing or unparsable go directive
+// does not satisfy any requirement above go1.0 — conservative on purpose,
+// since rewriting into a standard-library API the module's own toolchain
+// floor cannot yet provide would produce a build that does not compile.
+func (f *File) SatisfiesGo(since string) bool {
+	return GoVersionAtLeast(f.GoVersion, since)
+}
+
+// GoVersionAtLeast reports whether have (a go.mod go directive, or "") is at
+// least want (for example "go1.21"). want == "go1.0" is treated as always
+// satisfied, since no real Go toolchain is older than that.
+func GoVersionAtLeast(have, want string) bool {
+	wMaj, wMin, ok := parseGoVersion(want)
+	if !ok {
+		return false
+	}
+	if wMaj == 1 && wMin == 0 {
+		return true
+	}
+	hMaj, hMin, ok := parseGoVersion(have)
+	if !ok {
+		return false
+	}
+	if hMaj != wMaj {
+		return hMaj > wMaj
+	}
+	return hMin >= wMin
+}
+
+// parseGoVersion extracts the major and minor numbers from a version string
+// like "go1.21", "1.21", or "1.21.3". A patch component, if present, is
+// ignored: go.mod's go directive has only ever gated stdlib API availability
+// at minor-version granularity.
+func parseGoVersion(v string) (major, minor int, ok bool) {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "go")
+	if v == "" {
+		return 0, 0, false
+	}
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return maj, min, true
 }
 
 // Direct returns requires not marked "// indirect".
@@ -112,9 +193,19 @@ func Parse(r io.Reader) (*File, error) {
 			if req, ok := parseRequire(rest, indirect, line); ok {
 				f.Requires = append(f.Requires, req)
 			}
-		case "replace", "exclude", "retract", "godebug", "tool", "ignore":
-			// Counted, not resolved: a replace can redirect a module path, and
-			// the report says so rather than following it.
+		case "replace":
+			if rest == "(" {
+				if err := parseReplaceBlock(sc, &line, f); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if r, ok := parseReplace(rest, line); ok {
+				f.Replaces = append(f.Replaces, r)
+			}
+		case "exclude", "retract", "godebug", "tool", "ignore":
+			// Counted, not resolved: these do not redirect a module's code, so
+			// they carry no correctness risk for molt the way replace does.
 			f.Unknown[verb]++
 			if rest == "(" {
 				if err := skipBlock(sc, &line); err != nil {
@@ -174,6 +265,50 @@ func firstField(s string) (first, rest string) {
 		return s, ""
 	}
 	return s[:i], strings.TrimSpace(s[i:])
+}
+
+// parseReplace accepts "OLD [OLDVER] => NEW [NEWVER]". NEWVER is absent for a
+// local filesystem path on the right-hand side.
+func parseReplace(s string, line int) (Replace, bool) {
+	parts := strings.SplitN(s, "=>", 2)
+	if len(parts) != 2 {
+		return Replace{}, false
+	}
+	left := strings.Fields(parts[0])
+	right := strings.Fields(parts[1])
+	if len(left) == 0 || len(right) == 0 {
+		return Replace{}, false
+	}
+	r := Replace{Old: unquote(left[0]), New: unquote(right[0]), Line: line}
+	if len(left) >= 2 {
+		r.OldVersion = unquote(left[1])
+	}
+	if len(right) >= 2 {
+		r.NewVersion = unquote(right[1])
+	}
+	return r, true
+}
+
+// parseReplaceBlock reads a parenthesised replace block line by line.
+func parseReplaceBlock(sc *bufio.Scanner, line *int, f *File) error {
+	for sc.Scan() {
+		*line++
+		if *line > maxLines {
+			return fmt.Errorf("go.mod: exceeds %d lines", maxLines)
+		}
+		text, _ := splitComment(sc.Text())
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		if text == ")" {
+			return nil
+		}
+		if r, ok := parseReplace(text, *line); ok {
+			f.Replaces = append(f.Replaces, r)
+		}
+	}
+	return sc.Err()
 }
 
 // parseRequire accepts "path version". Anything else is skipped.

@@ -1,17 +1,18 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 
-	homedir "github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
+	"github.com/google/uuid"
 	"golang.org/x/exp/slices"
 	"golang.org/x/net/context"
 )
 
 // Config locates and describes an on-disk configuration.
 type Config struct {
+	ID    string
 	Path  string
 	Hosts []string
 }
@@ -22,19 +23,15 @@ func Load(ctx context.Context, hosts []string) (*Config, error) {
 		return nil, errors.New("at least one host is required")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, errors.Errorf("context already done: %v", err)
-	}
-
-	dir, err := homedir.Dir()
-	if err != nil {
-		return nil, errors.Errorf("cannot resolve home directory: %v", err)
+		return nil, fmt.Errorf("context already done: %w", err)
 	}
 
 	slices.Sort(hosts)
 	hosts = slices.Compact(hosts)
 
 	return &Config{
-		Path:  filepath.Join(dir, ".tidy", "config.json"),
+		ID:    uuid.New().String(),
+		Path:  filepath.Join(".tidy", "config.json"),
 		Hosts: hosts,
 	}, nil
 }
@@ -50,5 +47,5 @@ func main() {
 		fmt.Println("error:", err)
 		return
 	}
-	fmt.Println(cfg.Path, cfg.Hosts, cfg.Knows("a.example"))
+	fmt.Println(cfg.ID, cfg.Path, cfg.Hosts, cfg.Knows("a.example"))
 }

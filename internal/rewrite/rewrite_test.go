@@ -25,6 +25,13 @@ func apply(t *testing.T, src string, modules ...string) *Result {
 	for _, m := range modules {
 		migs = append(migs, mig(t, m))
 	}
+	return applyMigs(t, src, migs...)
+}
+
+// applyMigs is apply for callers that already have Migration values in hand,
+// which the synthetic fakes below need.
+func applyMigs(t *testing.T, src string, migs ...corpus.Migration) *Result {
+	t.Helper()
 	res, err := File("input.go", []byte(src), migs)
 	if err != nil {
 		t.Fatalf("File: %v", err)
@@ -34,6 +41,38 @@ func apply(t *testing.T, src string, modules ...string) *Result {
 		t.Fatalf("output does not parse: %v\n%s", err, res.Source)
 	}
 	return res
+}
+
+// fakeRename is a synthetic single-target migration with a real symbol
+// rename, used to exercise the rewriter's rename mechanics independently of
+// which real corpus row currently renames a symbol. None does at present:
+// pkg/errors.New/Errorf were removed for dropping stack traces (see
+// corpus.go), and every remaining mechanical row keeps its symbol names
+// unchanged.
+var fakeRename = corpus.Migration{
+	Module:   "example.com/fake/rename",
+	Pkg:      "rename",
+	Target:   "os",
+	Verified: true,
+	Symbols: map[string]corpus.Repl{
+		"Dir": {Symbol: "UserHomeDir"},
+	},
+}
+
+// fakeSplit is a synthetic multi-target migration used to exercise the
+// rewriter's split-across-packages machinery independently of which real
+// corpus row currently splits. pkg/errors no longer does: New and Errorf,
+// its only two-target symbols, were both removed for silently dropping a
+// stack trace (see corpus.go).
+var fakeSplit = corpus.Migration{
+	Module:   "example.com/fake/split",
+	Pkg:      "split",
+	Target:   "errors",
+	Verified: true,
+	Symbols: map[string]corpus.Repl{
+		"A": {Target: "errors", Symbol: "New"},
+		"B": {Target: "fmt", Symbol: "Errorf"},
+	},
 }
 
 func TestImportPathSwapOnly(t *testing.T) {
@@ -117,15 +156,15 @@ func main() {
 }
 
 func TestSymbolRename(t *testing.T) {
-	res := apply(t, `package main
+	res := applyMigs(t, `package main
 
-import "github.com/mitchellh/go-homedir"
+import "example.com/fake/rename"
 
 func main() {
-	dir, err := homedir.Dir()
+	dir, err := rename.Dir()
 	_, _ = dir, err
 }
-`, "github.com/mitchellh/go-homedir")
+`, fakeRename)
 
 	if !res.Changed() {
 		t.Fatalf("no edit made; refusals: %+v", res.Refusals)
@@ -134,7 +173,7 @@ func main() {
 	if !strings.Contains(got, "os.UserHomeDir()") {
 		t.Errorf("call not rewritten:\n%s", got)
 	}
-	if !strings.Contains(got, "\"os\"") || strings.Contains(got, "go-homedir") {
+	if !strings.Contains(got, "\"os\"") || strings.Contains(got, "fake/rename") {
 		t.Errorf("import not repointed:\n%s", got)
 	}
 	if len(res.Edits[0].Renames) != 1 || res.Edits[0].Renames[0] != "Dir -> UserHomeDir" {
@@ -142,24 +181,25 @@ func main() {
 	}
 }
 
-// pkg/errors splits across two stdlib packages: New goes to errors, Errorf goes
-// to fmt. This is the hardest mechanical case molt handles.
+// A migration can split across two stdlib packages. This is the hardest
+// mechanical case molt handles. No real corpus row does this today (see
+// fakeSplit's doc comment), so a synthetic migration exercises the mechanics.
 func TestSplitAcrossTwoStdlibPackages(t *testing.T) {
-	res := apply(t, `package main
+	res := applyMigs(t, `package main
 
 import (
 	"os"
 
-	"github.com/pkg/errors"
+	"example.com/fake/split"
 )
 
 func run() error {
 	if _, err := os.Open("x"); err != nil {
-		return errors.Errorf("open failed: %v", err)
+		return split.B("open failed: %v", err)
 	}
-	return errors.New("nothing to do")
+	return split.A("nothing to do")
 }
-`, "github.com/pkg/errors")
+`, fakeSplit)
 
 	if !res.Changed() {
 		t.Fatalf("no edit made; refusals: %+v", res.Refusals)
@@ -170,7 +210,7 @@ func run() error {
 			t.Errorf("missing %s in output:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "github.com/pkg/errors") {
+	if strings.Contains(got, "fake/split") {
 		t.Errorf("old import survived:\n%s", got)
 	}
 	edit := res.Edits[0]
@@ -179,22 +219,22 @@ func run() error {
 	}
 }
 
-// When the file already imports one of the targets, molt must reuse it rather
-// than emit a duplicate import.
+// When the file already imports one of the targets under its canonical
+// unaliased name, molt must reuse it rather than emit a duplicate import.
 func TestReusesExistingTargetImport(t *testing.T) {
-	res := apply(t, `package main
+	res := applyMigs(t, `package main
 
 import (
 	"fmt"
 
-	"github.com/pkg/errors"
+	"example.com/fake/split"
 )
 
 func run() error {
 	fmt.Println("working")
-	return errors.Errorf("failed %d times", 3)
+	return split.B("failed %d times", 3)
 }
-`, "github.com/pkg/errors")
+`, fakeSplit)
 
 	if !res.Changed() {
 		t.Fatalf("no edit made; refusals: %+v", res.Refusals)
@@ -203,7 +243,7 @@ func run() error {
 	if n := strings.Count(got, `"fmt"`); n != 1 {
 		t.Errorf(`"fmt" appears %d times, want 1:%s`, n, got)
 	}
-	if strings.Contains(got, "github.com/pkg/errors") {
+	if strings.Contains(got, "fake/split") {
 		t.Errorf("old import survived:\n%s", got)
 	}
 	if !strings.Contains(got, "fmt.Errorf(") {
@@ -211,20 +251,72 @@ func run() error {
 	}
 }
 
+// Reuse must be refused, not silently corrupted, when the existing import of
+// a target path uses an incompatible qualifier — the bug an automated review
+// caught: a file already importing fmt under an alias would otherwise end up
+// with call sites qualified "fmt" and no unaliased fmt import binding that
+// name at all.
+func TestRefusesReuseOfIncompatibleQualifier(t *testing.T) {
+	res := applyMigs(t, `package main
+
+import (
+	f "fmt"
+
+	"example.com/fake/split"
+)
+
+func run() error {
+	f.Println("working")
+	return split.B("failed %d times", 3)
+}
+`, fakeSplit)
+
+	if res.Changed() {
+		t.Fatalf("molt reused an incompatibly aliased import:\n%s", res.Source)
+	}
+	if len(res.Refusals) != 1 || !strings.Contains(res.Refusals[0].Reason, "already imported as") {
+		t.Fatalf("Refusals = %+v, want one about the conflicting alias", res.Refusals)
+	}
+}
+
+// The qualifier a migration would introduce must not collide with a local
+// binding elsewhere in the file — the second bug an automated review caught:
+// rewriting to fmt.Errorf when a local variable named fmt exists would bind
+// to that variable, not the package.
+func TestRefusesTargetQualifierCollision(t *testing.T) {
+	res := applyMigs(t, `package main
+
+import "example.com/fake/split"
+
+func run() error {
+	fmt := 5
+	_ = fmt
+	return split.B("failed")
+}
+`, fakeSplit)
+
+	if res.Changed() {
+		t.Fatalf("molt introduced a qualifier colliding with a local binding:\n%s", res.Source)
+	}
+	if len(res.Refusals) != 1 || !strings.Contains(res.Refusals[0].Reason, "shadowed") {
+		t.Fatalf("Refusals = %+v, want one about the shadowed qualifier", res.Refusals)
+	}
+}
+
 // Promoting a single-line import to the parenthesised form is a go/printer
 // detail that silently produces one-line garbage if Lparen is left invalid.
 func TestPromotesSingleLineImport(t *testing.T) {
-	res := apply(t, `package main
+	res := applyMigs(t, `package main
 
-import "github.com/pkg/errors"
+import "example.com/fake/split"
 
 func run() error {
-	if err := errors.New("x"); err != nil {
-		return errors.Errorf("wrapped: %v", err)
+	if err := split.A("x"); err != nil {
+		return split.B("wrapped: %v", err)
 	}
 	return nil
 }
-`, "github.com/pkg/errors")
+`, fakeSplit)
 
 	if !res.Changed() {
 		t.Fatalf("no edit made; refusals: %+v", res.Refusals)
@@ -264,17 +356,17 @@ func main() {
 // An aliased import cannot be split across two packages: there is only one
 // local name to go around.
 func TestRefusesAliasedSplit(t *testing.T) {
-	res := apply(t, `package main
+	res := applyMigs(t, `package main
 
-import errs "github.com/pkg/errors"
+import fs "example.com/fake/split"
 
 func run() error {
-	if err := errs.New("x"); err != nil {
-		return errs.Errorf("wrapped: %v", err)
+	if err := fs.A("x"); err != nil {
+		return fs.B("wrapped: %v", err)
 	}
 	return nil
 }
-`, "github.com/pkg/errors")
+`, fakeSplit)
 
 	if res.Changed() {
 		t.Fatalf("molt split an aliased import:\n%s", res.Source)

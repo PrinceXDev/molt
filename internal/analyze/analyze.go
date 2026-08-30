@@ -138,7 +138,7 @@ func Run(mod *gomod.File, src *scan.Result) *Report {
 			continue
 		}
 		covered[m.Module] = true
-		r.Findings = append(r.Findings, buildMigration(m, usage))
+		r.Findings = append(r.Findings, buildMigration(mod, m, usage))
 	}
 
 	if mod != nil {
@@ -162,8 +162,35 @@ func Run(mod *gomod.File, src *scan.Result) *Report {
 	return r
 }
 
+// Ineligible reports why a module-level fact makes m unsafe to apply
+// automatically to mod, regardless of what its per-file symbol usage looks
+// like. An empty string means neither check found a problem.
+//
+// Both checks are conservative by construction: a replace directive means the
+// code behind the import path might not be the code the corpus verified at
+// all, and a go directive below the migration's Since means the target
+// standard-library API may not exist in the toolchain the module declares it
+// needs. A module with no go directive is treated as not satisfying anything
+// above go1.0, since an unknown floor cannot be confirmed to be high enough.
+func Ineligible(mod *gomod.File, m corpus.Migration) string {
+	var have string
+	if mod != nil {
+		if rep, ok := mod.Replaced(m.Module); ok {
+			return fmt.Sprintf("go.mod replaces this module with %s; corpus verification does not apply to the replacement", rep.New)
+		}
+		have = mod.GoVersion
+	}
+	if !gomod.GoVersionAtLeast(have, m.Since) {
+		if have == "" {
+			return fmt.Sprintf("requires %s; the module's minimum Go version is not declared", m.Since)
+		}
+		return fmt.Sprintf("requires %s; module declares go %s", m.Since, have)
+	}
+	return ""
+}
+
 // buildMigration turns a corpus row plus observed usage into a finding.
-func buildMigration(m corpus.Migration, u *scan.Usage) Finding {
+func buildMigration(mod *gomod.File, m corpus.Migration, u *scan.Usage) Finding {
 	f := Finding{
 		Kind:     KindMigration,
 		Module:   m.Module,
@@ -175,14 +202,21 @@ func buildMigration(m corpus.Migration, u *scan.Usage) Finding {
 		Note:     m.Note,
 	}
 
-	if !m.Mechanical() {
+	switch {
+	case !m.Mechanical():
 		switch {
 		case m.Advisory:
 			f.Blockers = append(f.Blockers, "the replacement changes the shape of the code, not just its names")
 		case !m.Verified:
 			f.Blockers = append(f.Blockers, "replacement signatures not yet verified against a released toolchain")
 		}
-	} else {
+	case Ineligible(mod, m) != "":
+		// A module-level veto (replaced, or below the required Go version)
+		// applies to every file at once: no per-file symbol safety can make an
+		// unavailable standard-library API available.
+		f.Blockers = append(f.Blockers, Ineligible(mod, m))
+		f.BlockedFiles = append([]string(nil), u.Files...)
+	default:
 		// Per file, not per module: one awkward symbol in one file must not
 		// disqualify twenty clean ones. -apply works file by file too.
 		perFile := u.FileSymbols()

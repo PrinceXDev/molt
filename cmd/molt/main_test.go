@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"go/parser"
+	"go/token"
 	"io"
 	"io/fs"
 	"os"
@@ -10,6 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"molt/internal/gomod"
+	"molt/internal/scan"
 )
 
 func TestVersion(t *testing.T) {
@@ -178,14 +183,17 @@ func TestApplyProducesBuildableZeroDepModule(t *testing.T) {
 	// go mod tidy. Removing the requires here is that step, done explicitly so
 	// the test does not depend on the network that go mod tidy would want.
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"),
-		[]byte("module github.com/example/tidy\n\ngo 1.24\n"), 0o644); err != nil {
+		[]byte("module github.com/example/tidy\n\ngo 1.27\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	for _, args := range [][]string{{"build", "./..."}, {"test", "./..."}} {
 		cmd := exec.Command(goBin, args...)
 		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), "GOPROXY=off", "GOFLAGS=-mod=mod")
+		// GOTOOLCHAIN is pinned rather than inherited: the fixture's go.mod
+		// requires 1.27, and pinning avoids an auto-upgrade attempt that would
+		// need network access GOPROXY=off has otherwise deliberately removed.
+		cmd.Env = append(os.Environ(), "GOPROXY=off", "GOFLAGS=-mod=mod", "GOTOOLCHAIN=go1.27.0")
 		combined, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("go %s failed after molt -apply: %v\n%s",
@@ -236,25 +244,32 @@ func TestApplyLeavesAdvisoryFilesUntouched(t *testing.T) {
 		t.Error("main.go was modified, but mux and logrus are advisory-only")
 	}
 
-	// store.go carries three mechanical migrations, so all three must land.
+	// store.go carries one migration that is safely mechanical regardless of
+	// the module's declared Go version (x/exp/slices), and two that are not:
+	//
+	//   - pkg/errors.New and Errorf both silently drop a stack trace, so
+	//     neither is mechanical at all (see corpus.go).
+	//   - google/uuid.New needs Go 1.27, and example-app deliberately declares
+	//     go 1.24, so the version gate blocks it here on purpose. This is the
+	//     module the version-gate fix (an automated review finding) exists to
+	//     protect: applying it would leave a go.mod claiming 1.24 support
+	//     while depending on a Go 1.27-only standard-library package.
 	store, err := os.ReadFile(filepath.Join(dir, "store", "store.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := string(store)
-	for _, gone := range []string{
-		"github.com/pkg/errors",
-		"github.com/google/uuid",
-		"golang.org/x/exp/slices",
-	} {
-		if strings.Contains(body, gone) {
-			t.Errorf("%s survived a mechanical migration", gone)
-		}
+	if strings.Contains(body, "golang.org/x/exp/slices") {
+		t.Error("golang.org/x/exp/slices survived a mechanical migration")
 	}
-	for _, want := range []string{`"errors"`, `"fmt"`, `"slices"`, `"uuid"`} {
-		if !strings.Contains(body, want) {
-			t.Errorf("store.go missing stdlib import %s\n%s", want, body)
-		}
+	if !strings.Contains(body, `"slices"`) {
+		t.Errorf("store.go missing stdlib import \"slices\"\n%s", body)
+	}
+	if !strings.Contains(body, "github.com/pkg/errors") {
+		t.Error("github.com/pkg/errors was migrated despite New/Errorf dropping a stack trace")
+	}
+	if !strings.Contains(body, "github.com/google/uuid") {
+		t.Error("github.com/google/uuid was migrated despite the module declaring go 1.24, below the required go1.27")
 	}
 }
 
@@ -334,4 +349,135 @@ func snapshot(t *testing.T, dir string) string {
 		t.Fatal(err)
 	}
 	return sb.String()
+}
+
+// -apply must not touch a mechanical migration when the module's declared Go
+// version is below what the migration needs. example-app is exactly this
+// case: it declares go 1.24 and imports google/uuid, whose stdlib
+// replacement needs go1.27. Regression test for an automated review finding.
+func TestApplyRespectsGoVersionGate(t *testing.T) {
+	dir := copyFixture(t, "example-app")
+
+	var out, errBuf bytes.Buffer
+	if code := run([]string{"-v", dir}, &out, &errBuf); code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "go1.27") {
+		t.Errorf("report does not mention the go1.27 requirement:\n%s", out.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"-apply", dir}, &out, &errBuf); code != exitOK {
+		t.Fatalf("apply exit = %d (stderr: %s)", code, errBuf.String())
+	}
+
+	after, err := os.ReadFile(filepath.Join(dir, "store", "store.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(after, []byte("github.com/google/uuid")) {
+		t.Error("google/uuid was rewritten despite the module's go1.24 directive being below go1.27")
+	}
+}
+
+// -apply must refuse to run when a module replaces one of its dependencies:
+// the code behind the import path might not be what the corpus verified.
+func TestApplyRespectsReplaceDirective(t *testing.T) {
+	dir := copyFixture(t, "tidy-app")
+	goModPath := filepath.Join(dir, "go.mod")
+	original, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withReplace := string(original) + "\nreplace golang.org/x/exp => ../local-fork-of-exp\n"
+	if err := os.WriteFile(goModPath, []byte(withReplace), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errBuf bytes.Buffer
+	if code := run([]string{"-apply", dir}, &out, &errBuf); code != exitOK {
+		t.Fatalf("apply exit = %d (stderr: %s)", code, errBuf.String())
+	}
+
+	after, err := os.ReadFile(filepath.Join(dir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(after, []byte("golang.org/x/exp/slices")) {
+		t.Error("x/exp/slices was rewritten despite being replaced by a local fork")
+	}
+	// The other two migrations, unaffected by the replace, must still land.
+	if bytes.Contains(after, []byte("github.com/google/uuid")) {
+		t.Error("google/uuid should still have been migrated; it was not replaced")
+	}
+}
+
+// A read failure between scanning and rewriting must fail the run rather than
+// being silently logged and discarded. Regression test for an automated
+// review finding: previously such a failure printed to stderr and continued,
+// returning exit 0 for an incomplete requested operation.
+func TestRewriteReportsReadFailures(t *testing.T) {
+	dir := t.TempDir()
+	mod := &gomod.File{GoVersion: "1.27"}
+	// A scan.Result naming a file that was never written to disk simulates a
+	// read failure occurring between the scan and the rewrite.
+	src := &scan.Result{
+		Files: []*scan.File{
+			{
+				Path:      "missing.go",
+				Imports:   []scan.Import{{Path: "golang.org/x/exp/slices", Line: 1}},
+				Selectors: map[string][]scan.Sel{"slices": {{Symbol: "Sort", Line: 1}}},
+				Declared:  map[string]bool{},
+			},
+		},
+	}
+
+	var out, errBuf bytes.Buffer
+	changed, err := rewriteAll(dir, mod, src, false, &out, &errBuf)
+	if err == nil {
+		t.Fatal("rewriteAll returned a nil error for an unreadable file")
+	}
+	if !strings.Contains(err.Error(), "missing.go") {
+		t.Errorf("error = %v, want it to name missing.go", err)
+	}
+	if changed != 0 {
+		t.Errorf("changed = %d, want 0", changed)
+	}
+
+	// scanRoot's -apply branch already turns any rewriteAll error into
+	// exitInternal (see cmd/molt/main.go); the gap this test closes is that
+	// rewriteAll used to return nil here instead of an error at all.
+}
+
+// -apply must never leave a rewritten file truncated or half-written, and
+// must never leave its temporary file behind after a successful rewrite.
+func TestApplyWritesAtomicallyAndCleansUp(t *testing.T) {
+	dir := copyFixture(t, "tidy-app")
+
+	var out, errBuf bytes.Buffer
+	if code := run([]string{"-apply", dir}, &out, &errBuf); code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errBuf.String())
+	}
+
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(d.Name(), ".molt-") {
+			t.Errorf("leftover temp file: %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	main, err := os.ReadFile(filepath.Join(dir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "main.go", main, parser.SkipObjectResolution); err != nil {
+		t.Fatalf("rewritten main.go does not parse: %v", err)
+	}
 }

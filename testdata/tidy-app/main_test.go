@@ -14,6 +14,9 @@ func TestLoadSortsAndDeduplicates(t *testing.T) {
 	if len(cfg.Hosts) != 2 || cfg.Hosts[0] != "a" || cfg.Hosts[1] != "b" {
 		t.Errorf("Hosts = %v, want [a b]", cfg.Hosts)
 	}
+	if cfg.ID == "" {
+		t.Error("ID is empty")
+	}
 	if !cfg.Knows("a") {
 		t.Error("Knows(a) = false")
 	}

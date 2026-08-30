@@ -112,13 +112,21 @@ func TestReplacement(t *testing.T) {
 		t.Fatal("pkg/errors missing from corpus")
 	}
 
-	target, name, ok := errs.Replacement("Errorf")
-	if !ok || target != "fmt" || name != "Errorf" {
-		t.Errorf("Replacement(Errorf) = (%q, %q, %v), want (fmt, Errorf, true)", target, name, ok)
+	target, name, ok := errs.Replacement("Is")
+	if !ok || target != "errors" || name != "Is" {
+		t.Errorf("Replacement(Is) = (%q, %q, %v), want (errors, Is, true)", target, name, ok)
 	}
-	target, name, ok = errs.Replacement("New")
-	if !ok || target != "errors" || name != "New" {
-		t.Errorf("Replacement(New) = (%q, %q, %v), want (errors, New, true)", target, name, ok)
+	target, name, ok = errs.Replacement("Unwrap")
+	if !ok || target != "errors" || name != "Unwrap" {
+		t.Errorf("Replacement(Unwrap) = (%q, %q, %v), want (errors, Unwrap, true)", target, name, ok)
+	}
+	// New and Errorf both capture a stack trace stdlib errors/fmt do not, so
+	// they must stay blocked rather than resolve as a rename.
+	if _, _, ok := errs.Replacement("New"); ok {
+		t.Error("Replacement(New) succeeded; pkg/errors.New captures a stack trace stdlib errors.New does not")
+	}
+	if _, _, ok := errs.Replacement("Errorf"); ok {
+		t.Error("Replacement(Errorf) succeeded; pkg/errors.Errorf captures a stack trace fmt.Errorf does not")
 	}
 	if _, _, ok := errs.Replacement("Wrap"); ok {
 		t.Error("Replacement(Wrap) succeeded; Wrap changes argument shape and must be blocked")
@@ -187,6 +195,41 @@ func TestTrapsArePinned(t *testing.T) {
 		if _, blocked := maps.Blocked[sym]; !blocked {
 			t.Errorf("maps.%s must stay blocked: the return type changed from a slice to an iterator", sym)
 		}
+	}
+
+	// slices.SortStable does not exist in the standard library at all (only
+	// SortStableFunc does). Listing it as safe would emit code that fails to
+	// compile, which is worse than any other mistake this corpus can make.
+	if _, blocked := slices.Blocked["SortStable"]; !blocked {
+		t.Error("slices.SortStable must stay blocked: it does not exist in the standard library's slices package")
+	}
+	if _, safe := slices.Symbols["SortStable"]; safe {
+		t.Error("slices.SortStable must not be listed as a safe rename")
+	}
+
+	// pkg/errors.New and Errorf both capture a stack trace the stdlib
+	// equivalents do not. That is a feature removal, not a rename.
+	errs, ok := Lookup("github.com/pkg/errors")
+	if !ok {
+		t.Fatal("pkg/errors missing")
+	}
+	for _, sym := range []string{"New", "Errorf"} {
+		if _, blocked := errs.Blocked[sym]; !blocked {
+			t.Errorf("pkg/errors.%s must stay blocked: it captures a stack trace the stdlib replacement does not", sym)
+		}
+	}
+
+	// go-homedir.Dir caches its result; os.UserHomeDir does not. Signature
+	// equality is not enough to make this mechanical.
+	homedir, ok := Lookup("github.com/mitchellh/go-homedir")
+	if !ok {
+		t.Fatal("go-homedir missing")
+	}
+	if homedir.Mechanical() {
+		t.Error("go-homedir must not be mechanical: caching behaviour differs from os.UserHomeDir")
+	}
+	if !homedir.Advisory {
+		t.Error("go-homedir must be marked Advisory")
 	}
 }
 
