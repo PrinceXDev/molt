@@ -1,0 +1,5 @@
+# Build artifacts. The reproducible-build script leaves these behind.
+/molt
+/molt.exe
+/molt-build-1
+/molt-build-2
